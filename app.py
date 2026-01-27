@@ -43,6 +43,7 @@ class PM25Request(BaseModel):
 
 
 def pm25_to_aqi(pm):
+    pm = float(pm)
     if pm <= 30: return (pm / 30) * 50
     elif pm <= 60: return 50 + (pm - 30) * 50 / 30
     elif pm <= 90: return 100 + (pm - 60) * 100 / 30
@@ -54,7 +55,7 @@ def pm25_to_aqi(pm):
 @app.post("/forecast")
 def forecast(request: PM25Request):
 
-    pm_hist = np.array(request.pm25_history).reshape(-1, 1)
+    pm_hist = np.array(request.pm25_history, dtype=np.float32).reshape(-1, 1)
 
     if len(pm_hist) != LOOKBACK:
         raise HTTPException(
@@ -65,20 +66,27 @@ def forecast(request: PM25Request):
     pm_scaled = scaler.transform(pm_hist)
     pm_scaled = pm_scaled.reshape(1, -1)
 
-    x = torch.tensor(pm_scaled, dtype=torch.float32).to(device)
+    x = torch.tensor(pm_scaled).to(device)
 
     with torch.no_grad():
         _, forecast = model(x)
 
-    pm_pred = scaler.inverse_transform(
-        forecast.cpu().numpy().reshape(-1, 1)
-    ).flatten()
+    forecast = forecast.detach().cpu().numpy()
+
+    if forecast.ndim == 3:
+        forecast = forecast[0, 0, :]
+    elif forecast.ndim == 2:
+        forecast = forecast[0]
+
+    forecast = forecast.reshape(-1, 1)
+
+    pm_pred = scaler.inverse_transform(forecast).flatten()
 
     aqi_pred = [pm25_to_aqi(v) for v in pm_pred]
 
     return {
-        "pm25_forecast": pm_pred.tolist(),
-        "aqi_forecast": aqi_pred
+        "pm25_forecast": [float(x) for x in pm_pred],
+        "aqi_forecast": [float(x) for x in aqi_pred]
     }
 
 
