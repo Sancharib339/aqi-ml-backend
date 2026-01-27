@@ -1,52 +1,82 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import pickle
+from typing import List
+import torch
 import numpy as np
 
-# Define the input schema using Pydantic for validation
-class AQIInput(BaseModel):
-    PM2_5: float
-    PM10: float
-    NO2: float
-    SO2: float
-    CO: float
-    Ozone: float
-    Holidays_Count: int = 0  # default 0 if not provided
-    Days: int = 4            # default 4 if not provided
+from nbeats_pytorch.model import NBeatsNet
+from sklearn.preprocessing import StandardScaler
+from torch.serialization import add_safe_globals
 
-app = FastAPI(title="Delhi AQI Predictor")
+add_safe_globals([StandardScaler])
 
-# Load your pickle model
-with open("aqi_model.pkl", "rb") as f:
-    model = pickle.load(f)
+app = FastAPI()
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Define the expected feature order
-feature_cols = [
-    "Holidays_Count",
-    "Days",
-    "PM2_5",
-    "PM10",
-    "NO2",
-    "SO2",
-    "CO",
-    "Ozone"
-]
+checkpoint = torch.load(
+    "model/nbeats_pm25.pt",
+    map_location=device,
+    weights_only=False
+)
 
-@app.get("/")
-def home():
-    return {"status": "AQI model is running"}
+LOOKBACK = checkpoint["lookback"]
+HORIZON = checkpoint["horizon"]
 
-@app.post("/predict")
-def predict_aqi(data: AQIInput):
-    # Convert Pydantic model to dict
-    input_data = data.dict()
+model = NBeatsNet(
+    device=device,
+    stack_types=(NBeatsNet.GENERIC_BLOCK,) * 3,
+    nb_blocks_per_stack=3,
+    backcast_length=LOOKBACK,
+    forecast_length=HORIZON,
+    hidden_layer_units=512,
+    thetas_dim=(4, 4, 4)
+).to(device)
 
-    # Prepare features in the correct order
-    try:
-        features = np.array([[input_data[col] for col in feature_cols]])
-    except KeyError as e:
-        raise HTTPException(status_code=400, detail=f"Missing required feature: {e}")
+model.load_state_dict(checkpoint["model_state"])
+model.eval()
 
-    # Make prediction
-    prediction = model.predict(features)[0]
-    return {"AQI": float(prediction)}
+scaler = checkpoint["scaler"]
+
+
+class PM25Request(BaseModel):
+    pm25_history: List[float]
+
+
+def pm25_to_aqi(pm):
+    if pm <= 30: return (pm / 30) * 50
+    elif pm <= 60: return 50 + (pm - 30) * 50 / 30
+    elif pm <= 90: return 100 + (pm - 60) * 100 / 30
+    elif pm <= 120: return 200 + (pm - 90) * 100 / 30
+    elif pm <= 250: return 300 + (pm - 120) * 100 / 130
+    else: return 400 + (pm - 250) * 100 / 130
+
+
+@app.post("/forecast")
+def forecast(request: PM25Request):
+
+    pm_hist = np.array(request.pm25_history).reshape(-1, 1)
+
+    if len(pm_hist) != LOOKBACK:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Expected {LOOKBACK} values, got {len(pm_hist)}"
+        )
+
+    pm_scaled = scaler.transform(pm_hist)
+    pm_scaled = pm_scaled.reshape(1, -1)
+
+    x = torch.tensor(pm_scaled, dtype=torch.float32).to(device)
+
+    with torch.no_grad():
+        _, forecast = model(x)
+
+    pm_pred = scaler.inverse_transform(
+        forecast.cpu().numpy().reshape(-1, 1)
+    ).flatten()
+
+    aqi_pred = [pm25_to_aqi(v) for v in pm_pred]
+
+    return {
+        "pm25_forecast": pm_pred.tolist(),
+        "aqi_forecast": aqi_pred
+    }
