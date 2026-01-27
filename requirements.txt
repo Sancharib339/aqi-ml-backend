@@ -2,5 +2,6 @@ fastapi
 uvicorn
 torch
 numpy
-pandas
 scikit-learn
+nbeats-pytorch
+pydantic

@@ -80,3 +80,12 @@ def forecast(request: PM25Request):
         "pm25_forecast": pm_pred.tolist(),
         "aqi_forecast": aqi_pred
     }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "app:app",
+        host="0.0.0.0",
+        port=10000
+    )
